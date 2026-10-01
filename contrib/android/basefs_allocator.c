@@ -8,16 +8,50 @@
 struct base_fs_allocator {
 	struct ext2fs_hashmap *entries;
 	struct basefs_entry *cur_entry;
+	/* Blocks of the base already handed to a file of the new image. */
+	ext2fs_block_bitmap handed;
+	/* Blocks listed for more than one file in the base (deduplicated with -s). */
+	ext2fs_block_bitmap shared;
 };
 
 static errcode_t basefs_block_allocator(ext2_filsys, blk64_t, blk64_t *,
 					struct blk_alloc_ctx *ctx);
 
-static void fs_free_blocks_range(ext2_filsys fs, struct block_range *blocks)
+/*
+ * Picomisu: with deduplicated bases a block can belong to several files. Release only the
+ * blocks that no file got and, unless the whole allocator is torn down, that no other file of
+ * the base still lists; releasing them earlier let a directory or another file take a block
+ * that was later handed out again from the base ("EXT2 directory corrupted").
+ */
+static void fs_release_unused_blocks(ext2_filsys fs, struct base_fs_allocator *allocator,
+				     struct block_range *blocks, int keep_shared)
 {
+	blk64_t block;
+
 	while (blocks) {
-		ext2fs_unmark_block_bitmap_range2(fs->block_map, blocks->start,
-			blocks->end - blocks->start + 1);
+		for (block = blocks->start; block <= blocks->end; block++) {
+			if (ext2fs_test_block_bitmap2(allocator->handed, block))
+				continue;
+			if (keep_shared && ext2fs_test_block_bitmap2(allocator->shared, block))
+				continue;
+			ext2fs_unmark_block_bitmap2(fs->block_map, block);
+		}
+		blocks = blocks->next;
+	}
+}
+
+static void mark_shared_blocks(ext2fs_block_bitmap seen, ext2fs_block_bitmap shared,
+			       struct block_range *blocks)
+{
+	blk64_t block;
+
+	while (blocks) {
+		for (block = blocks->start; block <= blocks->end; block++) {
+			if (ext2fs_test_block_bitmap2(seen, block))
+				ext2fs_mark_block_bitmap2(shared, block);
+			else
+				ext2fs_mark_block_bitmap2(seen, block);
+		}
 		blocks = blocks->next;
 	}
 }
@@ -49,6 +83,23 @@ errcode_t base_fs_alloc_load(ext2_filsys fs, const char *file,
 	retval = ext2fs_read_bitmaps(fs);
 	if (retval)
 		goto err_bitmap;
+	retval = ext2fs_allocate_block_bitmap(fs, "base_fs handed", &allocator->handed);
+	if (retval)
+		goto err_bitmap;
+	retval = ext2fs_allocate_block_bitmap(fs, "base_fs shared", &allocator->shared);
+	if (retval)
+		goto err_handed;
+	{
+		ext2fs_block_bitmap seen;
+
+		retval = ext2fs_allocate_block_bitmap(fs, "base_fs seen", &seen);
+		if (retval)
+			goto err_shared;
+		while ((e = ext2fs_hashmap_iter_in_order(entries, &it)))
+			mark_shared_blocks(seen, allocator->shared, e->head);
+		ext2fs_free_block_bitmap(seen);
+		it = NULL;
+	}
 	while ((e = ext2fs_hashmap_iter_in_order(entries, &it)))
 		fs_reserve_blocks_range(fs, e->head);
 
@@ -61,6 +112,10 @@ errcode_t base_fs_alloc_load(ext2_filsys fs, const char *file,
 
 	return 0;
 
+err_shared:
+	ext2fs_free_block_bitmap(allocator->shared);
+err_handed:
+	ext2fs_free_block_bitmap(allocator->handed);
 err_bitmap:
 	free(allocator);
 err_alloc:
@@ -76,16 +131,23 @@ static errcode_t basefs_block_allocator(ext2_filsys fs, blk64_t goal,
 	struct base_fs_allocator *allocator = fs->priv_data;
 	struct basefs_entry *e = allocator->cur_entry;
 
-	/* Try to get a block from the base_fs */
-	if (e && e->head && ctx && (ctx->flags & BLOCK_ALLOC_DATA)) {
-		*ret = e->head->start;
+	/* Try to get a block from the base_fs that no other file got yet */
+	while (e && e->head && ctx && (ctx->flags & BLOCK_ALLOC_DATA)) {
+		blk64_t block = e->head->start;
+
 		e->head->start += 1;
 		if (e->head->start > e->head->end) {
 			next_range = e->head->next;
 			free(e->head);
 			e->head = next_range;
 		}
-	} else { /* Allocate a new block */
+		if (ext2fs_test_block_bitmap2(allocator->handed, block))
+			continue;
+		ext2fs_mark_block_bitmap2(allocator->handed, block);
+		*ret = block;
+		return 0;
+	}
+	{ /* Allocate a new block */
 		retval = ext2fs_new_block2(fs, goal, fs->block_map, ret);
 		if (retval)
 			return retval;
@@ -101,10 +163,12 @@ void base_fs_alloc_cleanup(ext2_filsys fs)
 	struct base_fs_allocator *allocator = fs->priv_data;
 
 	while ((e = ext2fs_hashmap_iter_in_order(allocator->entries, &it))) {
-		fs_free_blocks_range(fs, e->head);
+		fs_release_unused_blocks(fs, allocator, e->head, 0);
 		delete_block_ranges(e->head);
 		e->head = e->tail = NULL;
 	}
+	ext2fs_free_block_bitmap(allocator->handed);
+	ext2fs_free_block_bitmap(allocator->shared);
 
 	fs->priv_data = NULL;
 	fs->get_alloc_block2 = NULL;
@@ -140,7 +204,7 @@ errcode_t base_fs_alloc_unset_target(ext2_filsys fs,
 	if (!allocator || !allocator->cur_entry || mode != S_IFREG)
 		return 0;
 
-	fs_free_blocks_range(fs, allocator->cur_entry->head);
+	fs_release_unused_blocks(fs, allocator, allocator->cur_entry->head, 1);
 	delete_block_ranges(allocator->cur_entry->head);
 	allocator->cur_entry->head = allocator->cur_entry->tail = NULL;
 	allocator->cur_entry = NULL;
