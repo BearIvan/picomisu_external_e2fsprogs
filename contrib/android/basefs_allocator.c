@@ -167,6 +167,22 @@ void base_fs_alloc_cleanup(ext2_filsys fs)
 		delete_block_ranges(e->head);
 		e->head = e->tail = NULL;
 	}
+	/*
+	 * Shared blocks that unset_target kept while another file could still take them: once
+	 * every file is written, release those no file got. Otherwise they stay marked in use
+	 * (e2fsck "Block bitmap differences" when the base had files the new image drops).
+	 */
+	{
+		blk64_t block = fs->super->s_first_data_block;
+		blk64_t end = ext2fs_blocks_count(fs->super) - 1;
+
+		while (block <= end &&
+		       !ext2fs_find_first_set_block_bitmap2(allocator->shared, block, end, &block)) {
+			if (!ext2fs_test_block_bitmap2(allocator->handed, block))
+				ext2fs_unmark_block_bitmap2(fs->block_map, block);
+			block++;
+		}
+	}
 	ext2fs_free_block_bitmap(allocator->handed);
 	ext2fs_free_block_bitmap(allocator->shared);
 
